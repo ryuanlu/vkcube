@@ -10,7 +10,7 @@ GLSLC:=glslangValidator
 
 BINARY:=vkcube
 SRC:=cube.c esTransform.c main.c vkhelper.c hook.c
-PKGCONFIG_DEPS:=libpng xcb
+PKGCONFIG_DEPS:=xcb
 
 SHADERS:=vkcube.vert vkcube.frag
 SHADER_SPVS:=$(SHADERS:%=%.spv)

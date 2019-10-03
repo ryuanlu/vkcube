@@ -5,8 +5,6 @@
 #include <string.h>
 #include <strings.h>
 
-#include <png.h>
-
 #include <xcb/xcb.h>
 
 #define VK_USE_PLATFORM_XCB_KHR
