@@ -58,12 +58,11 @@
 #include <linux/input.h>
 
 #include "common.h"
+#include "hook.h"
 
 enum display_mode {
    DISPLAY_MODE_AUTO = 0,
    DISPLAY_MODE_HEADLESS,
-   DISPLAY_MODE_KMS,
-   DISPLAY_MODE_WAYLAND,
    DISPLAY_MODE_XCB,
    DISPLAY_MODE_KHR,
 };
@@ -296,6 +295,15 @@ init_buffer(struct vkcube *vc, struct vkcube_buffer *b)
       &b->cmd_buffer);
 }
 
+static void
+destroy_buffer(struct vkcube *vc, struct vkcube_buffer *b)
+{
+	vkFreeCommandBuffers(vc->device, vc->cmd_pool, 1, &b->cmd_buffer);
+	vkDestroyFence(vc->device, b->fence, NULL);
+	vkDestroyFramebuffer(vc->device, b->framebuffer, NULL);
+	vkDestroyImageView(vc->device, b->view, NULL);
+}
+
 /* Headless code - write one frame to png */
 
 static void
@@ -410,239 +418,6 @@ init_headless(struct vkcube *vc)
 
    return 0;
 }
-
-#ifdef HAVE_VULKAN_INTEL_H
-
-/* KMS display code - render to kernel modesetting fb */
-
-#include <vulkan/vulkan_intel.h>
-
-static struct termios save_tio;
-
-static void
-restore_vt(void)
-{
-   struct vt_mode mode = { .mode = VT_AUTO };
-   ioctl(STDIN_FILENO, VT_SETMODE, &mode);
-
-   tcsetattr(STDIN_FILENO, TCSANOW, &save_tio);
-   ioctl(STDIN_FILENO, KDSETMODE, KD_TEXT);
-}
-
-static void
-handle_signal(int sig)
-{
-   restore_vt();
-}
-
-static int
-init_vt(struct vkcube *vc)
-{
-   struct termios tio;
-   struct stat buf;
-   int ret;
-
-   /* First, save term io setting so we can restore properly. */
-   tcgetattr(STDIN_FILENO, &save_tio);
-
-   /* Make sure we're on a vt. */
-   ret = fstat(STDIN_FILENO, &buf);
-   fail_if(ret == -1, "failed to stat stdin\n");
-
-   if (major(buf.st_rdev) != TTY_MAJOR) {
-      fprintf(stderr, "stdin not a vt, running in no-display mode\n");
-      return -1;
-   }
-
-   atexit(restore_vt);
-
-   /* Set console input to raw mode. */
-   tio = save_tio;
-   tio.c_lflag &= ~(ICANON | ECHO);
-   tcsetattr(STDIN_FILENO, TCSANOW, &tio);
-
-   /* Restore console on SIGINT and friends. */
-   struct sigaction act = {
-      .sa_handler = handle_signal,
-      .sa_flags = SA_RESETHAND
-   };
-   sigaction(SIGINT, &act, NULL);
-   sigaction(SIGSEGV, &act, NULL);
-   sigaction(SIGABRT, &act, NULL);
-
-   /* We don't drop drm master, so block VT switching while we're
-    * running. Otherwise, switching to X on another VT will crash X when it
-    * fails to get drm master. */
-   struct vt_mode mode = { .mode = VT_PROCESS, .relsig = 0, .acqsig = 0 };
-   ret = ioctl(STDIN_FILENO, VT_SETMODE, &mode);
-   fail_if(ret == -1, "failed to take control of vt handling\n");
-
-   /* Set KD_GRAPHICS to disable fbcon while we render. */
-   ret = ioctl(STDIN_FILENO, KDSETMODE, KD_GRAPHICS);
-   fail_if(ret == -1, "failed to switch console to graphics mode\n");
-
-   return 0;
-}
-
-// Return -1 on failure.
-static int
-init_kms(struct vkcube *vc)
-{
-   drmModeRes *resources;
-   drmModeConnector *connector;
-   drmModeEncoder *encoder;
-   int i;
-
-   if (init_vt(vc) == -1)
-      return -1;
-
-   vc->fd = open("/dev/dri/card0", O_RDWR);
-   fail_if(vc->fd == -1, "failed to open /dev/dri/card0\n");
-
-   /* Get KMS resources and find the first active connecter. We'll use that
-      connector and the crtc driving it in the mode it's currently running. */
-   resources = drmModeGetResources(vc->fd);
-   fail_if(!resources, "drmModeGetResources failed: %s\n", strerror(errno));
-
-   for (i = 0; i < resources->count_connectors; i++) {
-      connector = drmModeGetConnector(vc->fd, resources->connectors[i]);
-      if (connector->connection == DRM_MODE_CONNECTED)
-         break;
-      drmModeFreeConnector(connector);
-      connector = NULL;
-   }
-
-   fail_if(!connector, "no connected connector!\n");
-   encoder = drmModeGetEncoder(vc->fd, connector->encoder_id);
-   fail_if(!encoder, "failed to get encoder\n");
-   vc->crtc = drmModeGetCrtc(vc->fd, encoder->crtc_id);
-   fail_if(!vc->crtc, "failed to get crtc\n");
-   printf("mode info: hdisplay %d, vdisplay %d\n",
-          vc->crtc->mode.hdisplay, vc->crtc->mode.vdisplay);
-
-   vc->connector = connector;
-   vc->width = vc->crtc->mode.hdisplay;
-   vc->height = vc->crtc->mode.vdisplay;
-
-   vc->gbm_device = gbm_create_device(vc->fd);
-
-   init_vk(vc, NULL);
-   vc->image_format = VK_FORMAT_R8G8B8A8_SRGB;
-   init_vk_objects(vc);
-
-   PFN_vkCreateDmaBufImageINTEL create_dma_buf_image =
-      (PFN_vkCreateDmaBufImageINTEL)vkGetDeviceProcAddr(vc->device, "vkCreateDmaBufImageINTEL");
-
-   for (uint32_t i = 0; i < 2; i++) {
-      struct vkcube_buffer *b = &vc->buffers[i];
-      int fd, stride, ret;
-
-      b->gbm_bo = gbm_bo_create(vc->gbm_device, vc->width, vc->height,
-                                GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT);
-
-      fd = gbm_bo_get_fd(b->gbm_bo);
-      stride = gbm_bo_get_stride(b->gbm_bo);
-      create_dma_buf_image(vc->device,
-                           &(VkDmaBufImageCreateInfo) {
-                              .sType = VK_STRUCTURE_TYPE_DMA_BUF_IMAGE_CREATE_INFO_INTEL,
-                              .fd = fd,
-                              .format = vc->image_format,
-                              .extent = { vc->width, vc->height, 1 },
-                              .strideInBytes = stride
-                           },
-                           NULL,
-                           &b->mem,
-                           &b->image);
-      close(fd);
-
-      b->stride = gbm_bo_get_stride(b->gbm_bo);
-      uint32_t bo_handles[4] = { gbm_bo_get_handle(b->gbm_bo).s32, };
-      uint32_t pitches[4] = { stride, };
-      uint32_t offsets[4] = { 0, };
-      ret = drmModeAddFB2(vc->fd, vc->width, vc->height,
-                          DRM_FORMAT_XRGB8888, bo_handles,
-                          pitches, offsets, &b->fb, 0);
-      fail_if(ret == -1, "addfb2 failed\n");
-
-      init_buffer(vc, b);
-   }
-
-   return 0;
-}
-
-static void
-page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
-{
-}
-
-static void
-mainloop_vt(struct vkcube *vc)
-{
-   int len, ret;
-   char buf[16];
-   struct pollfd pfd[2];
-   struct vkcube_buffer *b;
-
-   pfd[0].fd = STDIN_FILENO;
-   pfd[0].events = POLLIN;
-   pfd[1].fd = vc->fd;
-   pfd[1].events = POLLIN;
-
-   drmEventContext evctx = {
-      .version = 2,
-      .page_flip_handler = page_flip_handler,
-   };
-
-   ret = drmModeSetCrtc(vc->fd, vc->crtc->crtc_id, vc->buffers[0].fb,
-                        0, 0, &vc->connector->connector_id, 1, &vc->crtc->mode);
-   fail_if(ret < 0, "modeset failed: %m\n");
-
-
-   ret = drmModePageFlip(vc->fd, vc->crtc->crtc_id, vc->buffers[0].fb,
-                         DRM_MODE_PAGE_FLIP_EVENT, NULL);
-   fail_if(ret < 0, "pageflip failed: %m\n");
-
-   while (1) {
-      ret = poll(pfd, 2, -1);
-      fail_if(ret == -1, "poll failed\n");
-      if (pfd[0].revents & POLLIN) {
-         len = read(STDIN_FILENO, buf, sizeof(buf));
-         switch (buf[0]) {
-         case 'q':
-            return;
-         case '\e':
-            if (len == 1)
-               return;
-         }
-      }
-      if (pfd[1].revents & POLLIN) {
-         drmHandleEvent(vc->fd, &evctx);
-         b = &vc->buffers[vc->current & 1];
-         vc->model.render(vc, b);
-
-         ret = drmModePageFlip(vc->fd, vc->crtc->crtc_id, b->fb,
-                               DRM_MODE_PAGE_FLIP_EVENT, NULL);
-         fail_if(ret < 0, "pageflip failed: %m\n");
-         vc->current++;
-      }
-   }
-}
-
-#else
-
-static int
-init_kms(struct vkcube *vc)
-{
-   return -1;
-}
-
-static void
-mainloop_vt(struct vkcube *vc)
-{
-}
-
-#endif
 
 /* Swapchain-based code - shared between XCB and Wayland */
 
@@ -897,7 +672,9 @@ mainloop_xcb(struct vkcube *vc)
 
             if (client_message->type == vc->xcb.atom_wm_protocols &&
                 client_message->data.data32[0] == vc->xcb.atom_wm_delete_window) {
-               exit(0);
+	       free(event);
+	       return;
+
             }
 
             if (client_message->type == XCB_ATOM_NOTICE)
@@ -910,6 +687,9 @@ mainloop_xcb(struct vkcube *vc)
                 vc->height != configure->height) {
                if (vc->image_count > 0) {
                   vkDestroySwapchainKHR(vc->device, vc->swap_chain, NULL);
+		  int i;
+		  for(i = 0;i < vc->image_count;++i)
+		     destroy_buffer(vc, &vc->buffers[i]);
                   vc->image_count = 0;
                }
 
@@ -973,267 +753,6 @@ mainloop_xcb(struct vkcube *vc)
       }
 
       xcb_flush(vc->xcb.conn);
-   }
-}
-
-/* Wayland display code - render to Wayland window */
-
-static void
-handle_xdg_surface_configure(void *data, struct zxdg_surface_v6 *surface,
-                             uint32_t serial)
-{
-   struct vkcube *vc = data;
-
-   zxdg_surface_v6_ack_configure(surface, serial);
-
-   if (vc->wl.wait_for_configure) {
-      // redraw
-      vc->wl.wait_for_configure = false;
-   }
-}
-
-static const struct zxdg_surface_v6_listener xdg_surface_listener = {
-   handle_xdg_surface_configure,
-};
-
-static void
-handle_xdg_toplevel_configure(void *data, struct zxdg_toplevel_v6 *toplevel,
-                              int32_t width, int32_t height,
-                              struct wl_array *states)
-{
-}
-
-static void
-handle_xdg_toplevel_close(void *data, struct zxdg_toplevel_v6 *toplevel)
-{
-}
-
-static const struct zxdg_toplevel_v6_listener xdg_toplevel_listener = {
-   handle_xdg_toplevel_configure,
-   handle_xdg_toplevel_close,
-};
-
-static void
-handle_xdg_shell_ping(void *data, struct zxdg_shell_v6 *shell, uint32_t serial)
-{
-   zxdg_shell_v6_pong(shell, serial);
-}
-
-static const struct zxdg_shell_v6_listener xdg_shell_listener = {
-   handle_xdg_shell_ping,
-};
-
-static void
-handle_wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
-			  uint32_t format, int32_t fd, uint32_t size)
-{
-}
-
-static void
-handle_wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
-			 uint32_t serial, struct wl_surface *surface,
-			 struct wl_array *keys)
-{
-}
-
-static void
-handle_wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
-			 uint32_t serial, struct wl_surface *surface)
-{
-}
-
-static void
-handle_wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
-		       uint32_t serial, uint32_t time, uint32_t key,
-		       uint32_t state)
-{
-    if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED)
-      exit(0);
-}
-
-static void
-handle_wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
-			     uint32_t serial, uint32_t mods_depressed,
-			     uint32_t mods_latched, uint32_t mods_locked,
-			     uint32_t group)
-{
-}
-
-static void
-handle_wl_keyboard_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
-			       int32_t rate, int32_t delay)
-{
-}
-
-static const struct wl_keyboard_listener wl_keyboard_listener = {
-   .keymap = handle_wl_keyboard_keymap,
-   .enter = handle_wl_keyboard_enter,
-   .leave = handle_wl_keyboard_leave,
-   .key = handle_wl_keyboard_key,
-   .modifiers = handle_wl_keyboard_modifiers,
-   .repeat_info = handle_wl_keyboard_repeat_info,
-};
-
-static void
-handle_wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
-			    uint32_t capabilities)
-{
-   struct vkcube *vc = data;
-
-   if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && (!vc->wl.keyboard)) {
-      vc->wl.keyboard = wl_seat_get_keyboard(wl_seat);
-      wl_keyboard_add_listener(vc->wl.keyboard, &wl_keyboard_listener, vc);
-   } else if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && vc->wl.keyboard) {
-      wl_keyboard_destroy(vc->wl.keyboard);
-      vc->wl.keyboard = NULL;
-   }
-}
-
-static const struct wl_seat_listener wl_seat_listener = {
-   handle_wl_seat_capabilities,
-};
-
-static void
-registry_handle_global(void *data, struct wl_registry *registry,
-		       uint32_t name, const char *interface, uint32_t version)
-{
-   struct vkcube *vc = data;
-
-   if (strcmp(interface, "wl_compositor") == 0) {
-      vc->wl.compositor = wl_registry_bind(registry, name,
-                                           &wl_compositor_interface, 1);
-   } else if (strcmp(interface, "zxdg_shell_v6") == 0) {
-      vc->wl.shell = wl_registry_bind(registry, name, &zxdg_shell_v6_interface, 1);
-      zxdg_shell_v6_add_listener(vc->wl.shell, &xdg_shell_listener, vc);
-   } else if (strcmp(interface, "wl_seat") == 0) {
-      vc->wl.seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
-      wl_seat_add_listener(vc->wl.seat, &wl_seat_listener, vc);
-   }
-}
-
-static void
-registry_handle_global_remove(void *data, struct wl_registry *registry,
-			      uint32_t name)
-{
-}
-
-static const struct wl_registry_listener registry_listener = {
-   registry_handle_global,
-   registry_handle_global_remove
-};
-
-// Return -1 on failure.
-static int
-init_wayland(struct vkcube *vc)
-{
-   vc->wl.display = wl_display_connect(NULL);
-   if (!vc->wl.display)
-      return -1;
-
-   vc->wl.seat = NULL;
-   vc->wl.keyboard = NULL;
-   vc->wl.shell = NULL;
-
-   struct wl_registry *registry = wl_display_get_registry(vc->wl.display);
-   wl_registry_add_listener(registry, &registry_listener, vc);
-
-   /* Round-trip to get globals */
-   wl_display_roundtrip(vc->wl.display);
-
-   /* We don't need this anymore */
-   wl_registry_destroy(registry);
-
-   vc->wl.surface = wl_compositor_create_surface(vc->wl.compositor);
-
-   if (!vc->wl.shell)
-      fail("Compositor is missing unstable zxdg_shell_v6 protocol support");
-
-   vc->wl.xdg_surface = zxdg_shell_v6_get_xdg_surface(vc->wl.shell,
-                                                      vc->wl.surface);
-
-   zxdg_surface_v6_add_listener(vc->wl.xdg_surface, &xdg_surface_listener, vc);
-
-   vc->wl.xdg_toplevel = zxdg_surface_v6_get_toplevel(vc->wl.xdg_surface);
-
-   zxdg_toplevel_v6_add_listener(vc->wl.xdg_toplevel, &xdg_toplevel_listener, vc);
-   zxdg_toplevel_v6_set_title(vc->wl.xdg_toplevel, "vkcube");
-
-   vc->wl.wait_for_configure = true;
-   wl_surface_commit(vc->wl.surface);
-
-   init_vk(vc, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
-
-   PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR get_wayland_presentation_support =
-      (PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)
-      vkGetInstanceProcAddr(vc->instance, "vkGetPhysicalDeviceWaylandPresentationSupportKHR");
-   PFN_vkCreateWaylandSurfaceKHR create_wayland_surface =
-      (PFN_vkCreateWaylandSurfaceKHR)
-      vkGetInstanceProcAddr(vc->instance, "vkCreateWaylandSurfaceKHR");
-
-   if (!get_wayland_presentation_support(vc->physical_device, 0,
-                                         vc->wl.display)) {
-      fail("Vulkan not supported on given Wayland surface");
-   }
-
-   create_wayland_surface(vc->instance,
-                          &(VkWaylandSurfaceCreateInfoKHR) {
-         .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
-         .display = vc->wl.display,
-         .surface = vc->wl.surface,
-      }, NULL, &vc->surface);
-
-   vc->image_format = choose_surface_format(vc);
-
-   init_vk_objects(vc);
-
-   create_swapchain(vc);
-
-   return 0;
-}
-
-static void
-mainloop_wayland(struct vkcube *vc)
-{
-   VkResult result = VK_SUCCESS;
-   struct pollfd fds[] = {
-      { wl_display_get_fd(vc->wl.display), POLLIN },
-   };
-   while (1) {
-      uint32_t index;
-
-      while (wl_display_prepare_read(vc->wl.display) != 0)
-         wl_display_dispatch_pending(vc->wl.display);
-      if (wl_display_flush(vc->wl.display) < 0 && errno != EAGAIN) {
-         wl_display_cancel_read(vc->wl.display);
-         return;
-      }
-      if (poll(fds, 1, 0) > 0) {
-         wl_display_read_events(vc->wl.display);
-         wl_display_dispatch_pending(vc->wl.display);
-      } else {
-         wl_display_cancel_read(vc->wl.display);
-      }
-
-      result = vkAcquireNextImageKHR(vc->device, vc->swap_chain, 60,
-                                     vc->semaphore, VK_NULL_HANDLE, &index);
-      if (result != VK_SUCCESS)
-         return;
-
-      assert(index <= MAX_NUM_IMAGES);
-      vc->model.render(vc, &vc->buffers[index]);
-
-      vkQueuePresentKHR(vc->queue,
-         &(VkPresentInfoKHR) {
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .swapchainCount = 1,
-            .pSwapchains = (VkSwapchainKHR[]) { vc->swap_chain, },
-            .pImageIndices = (uint32_t[]) { index, },
-            .pResults = &result,
-         });
-      if (result != VK_SUCCESS)
-         return;
-
-      vkQueueWaitIdle(vc->queue);
    }
 }
 
@@ -1482,12 +1001,6 @@ display_mode_from_string(const char *s, enum display_mode *mode)
    } else if (streq(s, "headless")) {
       *mode = DISPLAY_MODE_HEADLESS;
       return true;
-   } else if (streq(s, "kms")) {
-      *mode = DISPLAY_MODE_KMS;
-      return true;
-   } else if (streq(s, "wayland")) {
-      *mode = DISPLAY_MODE_WAYLAND;
-      return true;
    } else if (streq(s, "xcb")) {
       *mode = DISPLAY_MODE_XCB;
       return true;
@@ -1606,25 +1119,11 @@ init_display(struct vkcube *vc)
 {
    switch (display_mode) {
    case DISPLAY_MODE_AUTO:
-      display_mode = DISPLAY_MODE_WAYLAND;
-      if (init_wayland(vc) == -1) {
-         fprintf(stderr, "failed to initialize wayland, falling back "
-                         "to xcb\n");
          display_mode = DISPLAY_MODE_XCB;
          if (init_xcb(vc) == -1) {
             fprintf(stderr, "failed to initialize xcb, falling back "
                             "to kms\n");
-            display_mode = DISPLAY_MODE_KMS;
-            if (init_kms(vc) == -1) {
-               fprintf(stderr, "failed to initialize xcb, falling "
-                               "back to headless\n");
-               display_mode = DISPLAY_MODE_HEADLESS;
-               if (init_headless(vc) == -1) {
-                  fail("failed to initialize headless mode");
-               }
-            }
          }
-      }
       break;
    case DISPLAY_MODE_HEADLESS:
       if (init_headless(vc) == -1)
@@ -1633,14 +1132,6 @@ init_display(struct vkcube *vc)
    case DISPLAY_MODE_KHR:
       if (init_khr(vc) == -1)
          fail("fail to initialize khr");
-      break;
-   case DISPLAY_MODE_KMS:
-      if (init_kms(vc) == -1)
-         fail("failed to initialize kms");
-      break;
-   case DISPLAY_MODE_WAYLAND:
-      if (init_wayland(vc) == -1)
-         fail("failed to initialize wayland");
       break;
    case DISPLAY_MODE_XCB:
       if (init_xcb(vc) == -1)
@@ -1656,14 +1147,8 @@ mainloop(struct vkcube *vc)
    case DISPLAY_MODE_AUTO:
       assert(!"display mode is unset");
       break;
-   case DISPLAY_MODE_WAYLAND:
-      mainloop_wayland(vc);
-      break;
    case DISPLAY_MODE_XCB:
       mainloop_xcb(vc);
-      break;
-   case DISPLAY_MODE_KMS:
-      mainloop_vt(vc);
       break;
    case DISPLAY_MODE_KHR:
       mainloop_khr(vc);
@@ -1677,20 +1162,38 @@ mainloop(struct vkcube *vc)
 
 int main(int argc, char *argv[])
 {
+   int i;
    struct vkcube vc;
 
    parse_args(argc, argv);
 
    vc.model = cube_model;
-   vc.gbm_device = NULL;
    vc.xcb.window = XCB_NONE;
-   vc.wl.surface = NULL;
-   vc.width = 1024;
-   vc.height = 768;
+   vc.width = 1280;
+   vc.height = 720;
    gettimeofday(&vc.start_tv, NULL);
 
    init_display(&vc);
    mainloop(&vc);
+
+   for(i = 0;i < vc.image_count;++i)
+      destroy_buffer(&vc, &vc.buffers[i]);
+
+   vkDestroyDescriptorPool(vc.device, vc.desc_pool, NULL);
+   vkDestroyBuffer(vc.device, vc.buffer, NULL);
+   vkDestroySemaphore(vc.device, vc.semaphore, NULL);
+   vkDestroyPipelineLayout(vc.device, vc.pipeline_layout, NULL);
+   vkDestroyPipeline(vc.device, vc.pipeline, NULL);
+   vkDestroyRenderPass(vc.device, vc.render_pass, NULL);
+   vkDestroyCommandPool(vc.device, vc.cmd_pool, NULL);
+   vkFreeMemory(vc.device, vc.mem, NULL);
+   vkDestroySwapchainKHR(vc.device, vc.swap_chain, NULL);
+   vkDestroyDevice(vc.device, NULL);
+
+   vkDestroySurfaceKHR(vc.instance, vc.surface, NULL);
+   vkDestroyInstance(vc.instance, NULL);
+   xcb_destroy_window(vc.xcb.conn, vc.xcb.window);
+   xcb_disconnect(vc.xcb.conn);
 
    return 0;
 }

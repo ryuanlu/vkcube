@@ -5,22 +5,13 @@
 #include <string.h>
 #include <strings.h>
 
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <drm_fourcc.h>
 #include <png.h>
 
 #include <xcb/xcb.h>
 
-#include <wayland-client.h>
-#include <xdg-shell-unstable-v6-client-protocol.h>
-
 #define VK_USE_PLATFORM_XCB_KHR
-#define VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_PROTOTYPES
 #include <vulkan/vulkan.h>
-
-#include <gbm.h>
 
 #include "esUtil.h"
 
@@ -52,7 +43,6 @@ struct vkcube {
    struct model model;
 
    int fd;
-   struct gbm_device *gbm_device;
 
    struct {
       xcb_connection_t *conn;
@@ -62,25 +52,11 @@ struct vkcube {
    } xcb;
 
    struct {
-      struct wl_display *display;
-      struct wl_compositor *compositor;
-      struct zxdg_shell_v6 *shell;
-      struct wl_keyboard *keyboard;
-      struct wl_seat *seat;
-      struct wl_surface *surface;
-      struct zxdg_surface_v6 *xdg_surface;
-      struct zxdg_toplevel_v6 *xdg_toplevel;
-      bool wait_for_configure;
-   } wl;
-
-   struct {
       VkDisplayModeKHR display_mode;
    } khr;
 
    VkSwapchainKHR swap_chain;
 
-   drmModeCrtc *crtc;
-   drmModeConnector *connector;
    uint32_t width, height;
 
    VkInstance instance;
@@ -93,6 +69,7 @@ struct vkcube {
    VkPipeline pipeline;
    VkDeviceMemory mem;
    VkBuffer buffer;
+   VkDescriptorPool desc_pool;
    VkDescriptorSet descriptor_set;
    VkSemaphore semaphore;
    VkCommandPool cmd_pool;

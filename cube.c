@@ -364,7 +364,6 @@ init_cube(struct vkcube *vc)
 
    vkBindBufferMemory(vc->device, vc->buffer, vc->mem, 0);
 
-   VkDescriptorPool desc_pool;
    const VkDescriptorPoolCreateInfo create_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .pNext = NULL,
@@ -379,12 +378,12 @@ init_cube(struct vkcube *vc)
       }
    };
 
-   vkCreateDescriptorPool(vc->device, &create_info, NULL, &desc_pool);
+   vkCreateDescriptorPool(vc->device, &create_info, NULL, &vc->desc_pool);
 
    vkAllocateDescriptorSets(vc->device,
       &(VkDescriptorSetAllocateInfo) {
          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-         .descriptorPool = desc_pool,
+         .descriptorPool = vc->desc_pool,
          .descriptorSetCount = 1,
          .pSetLayouts = &set_layout,
       }, &vc->descriptor_set);
@@ -406,6 +405,10 @@ init_cube(struct vkcube *vc)
                              }
                           },
                           0, NULL);
+
+   vkDestroyDescriptorSetLayout(vc->device, set_layout, NULL);
+   vkDestroyShaderModule(vc->device, vs_module, NULL);
+   vkDestroyShaderModule(vc->device, fs_module, NULL);
 }
 
 static void

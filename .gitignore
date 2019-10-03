@@ -1,3 +1,7 @@
 *~
-# I like to build in build* named subdirectories
-build*
+*.o
+*.spv.h
+*.spv
+*.vert.c
+*.frag.c
+vkcube
