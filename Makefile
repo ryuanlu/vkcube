@@ -8,36 +8,47 @@ include build.mk
 
 GLSLC:=glslangValidator
 
-BINARY:=vkcube
-SRC:=cube.c esTransform.c main.c vkhelper.c hook.c
-PKGCONFIG_DEPS:=xcb
+VKCUBE_BINARY:=vkcube
+VKCUBE_SRC:=cube.c esTransform.c main.c
+VKCUBE_PKGCONFIG_DEPS:=xcb
 
 SHADERS:=vkcube.vert vkcube.frag
 SHADER_SPVS:=$(SHADERS:%=%.spv)
 SHADER_HEADERS:=$(SHADERS:%=%.spv.h)
+
+
+HOOK_LIBRARY:=hook.so
+HOOK_SRC:=hook.c vkhelper.c
 
 BLIT_SHADERS:=blit.vert blit.frag
 BLIT_SHADER_SPVS:=$(BLIT_SHADERS:%=%.spv)
 BLIT_SHADER_SOURCES:=$(BLIT_SHADERS:%=%.c)
 BLIT_SHADER_OBJECTS:=$(BLIT_SHADERS:%=%.o)
 
-ifeq ($(ENABLE_HOOK),yes)
-HOOK_FLAG:=-DENABLE_HOOK
-else
-HOOK_FLAG:=
-endif
+#
+# To run vkcube with hook and sanitizer, use below command
+#
+# $ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.3:./hook.so ./vkcube
+#
 
 SANITIZER_FLAGS:=-fsanitize=address
+
 DEBUG_FLAGS:=-g $(SANITIZER_FLAGS)
 
-all: $(BINARY)
 
-clean:
-	rm -f *.o $(BINARY) $(SHADER_HEADERS) $(SHADER_SPVS) $(BLIT_SHADER_SOURCES) $(BLIT_SHADER_SPVS)
+all: $(VKCUBE_BINARY) $(HOOK_LIBRARY)
 
-$(BINARY)_cflags:=-I./ -Wall $(DEBUG_FLAGS) $(HOOK_FLAG)
-$(BINARY)_ldflags:=$(shell pkg-config --libs $(PKGCONFIG_DEPS)) -lvulkan -lm $(DEBUG_FLAGS)
-$(eval $(call define_c_target,$(BINARY),$(SRC) $(BLIT_SHADER_SOURCES)))
+clean: $(VKCUBE_BINARY)_clean $(HOOK_LIBRARY)_clean
+	rm -f $(SHADER_HEADERS) $(SHADER_SPVS) $(BLIT_SHADER_SOURCES) $(BLIT_SHADER_SPVS)
+
+$(VKCUBE_BINARY)_cflags:=-I./ -Wall $(DEBUG_FLAGS)
+$(VKCUBE_BINARY)_ldflags:=$(shell pkg-config --libs $(VKCUBE_PKGCONFIG_DEPS)) -lvulkan -lm $(DEBUG_FLAGS)
+$(eval $(call define_c_target,$(VKCUBE_BINARY),$(VKCUBE_SRC)))
+
+$(HOOK_LIBRARY)_cflags:=-I./ -Wall -fPIC $(DEBUG_FLAGS)
+$(HOOK_LIBRARY)_ldflags:=-lvulkan -shared $(DEBUG_FLAGS)
+$(eval $(call define_c_target,$(HOOK_LIBRARY),$(HOOK_SRC) $(BLIT_SHADER_SOURCES)))
+
 
 $(SHADER_SPVS) $(BLIT_SHADER_SPVS): %.spv: %
 	@echo "\tGLSLC\t$@"

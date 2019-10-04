@@ -10,4 +10,7 @@ $(1): $$($(1)_obj_files)
 	@echo "\tLD\t$$@"
 	$$(CC) $$^ -o $$@ $$($(1)_ldflags)
 
+$(1)_clean:
+	@echo "\tCLEAN\t$(1)"
+	rm -f $$($(1)_obj_files) $(1)
 endef

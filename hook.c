@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 #include <vulkan/vulkan.h>
 #include "vkhelper.h"
 
+#define LIBVULKAN_FILE_NAME	"libvulkan.so.1"
 #define SKIP_MESSAGE_TIMES	(60)
 #define TEXTURE_IMAGE_FILE	"cthead.bin"
 #define TEXTURE_IMAGE_WIDTH	(256)
@@ -29,12 +31,52 @@ struct hook_context
 };
 
 static struct hook_context*	context = NULL;
+static struct vulkan_api*	vulkan = NULL;
 
 extern unsigned char blit_vert_spv[];
 extern unsigned int blit_vert_spv_len;
 
 extern unsigned char blit_frag_spv[];
 extern unsigned int blit_frag_spv_len;
+
+
+struct vulkan_api
+{
+	void*				handle;
+	PFN_vkCreateDevice		vkCreateDevice;
+	PFN_vkDestroyDevice		vkDestroyDevice;
+	PFN_vkCreateSwapchainKHR	vkCreateSwapchainKHR;
+	PFN_vkDestroySwapchainKHR	vkDestroySwapchainKHR;
+	PFN_vkAcquireNextImageKHR	vkAcquireNextImageKHR;
+	PFN_vkQueuePresentKHR		vkQueuePresentKHR;
+};
+
+
+struct vulkan_api* vulkan_api_init(void)
+{
+	struct vulkan_api* api = NULL;
+	api = calloc(1, sizeof(struct vulkan_api));
+	api->handle = dlopen(LIBVULKAN_FILE_NAME, RTLD_NOW);
+
+	api->vkCreateDevice		 = dlsym(api->handle, "vkCreateDevice");
+	api->vkDestroyDevice		 = dlsym(api->handle, "vkDestroyDevice");
+	api->vkCreateSwapchainKHR	 = dlsym(api->handle, "vkCreateSwapchainKHR");
+	api->vkDestroySwapchainKHR	 = dlsym(api->handle, "vkDestroySwapchainKHR");
+	api->vkAcquireNextImageKHR	 = dlsym(api->handle, "vkAcquireNextImageKHR");
+	api->vkQueuePresentKHR		 = dlsym(api->handle, "vkQueuePresentKHR");
+
+	fprintf(stderr, "vulkan_api_init\n");
+
+	return api;
+}
+
+
+void vulkan_api_destroy(struct vulkan_api* vulkan)
+{
+	dlclose(vulkan->handle);
+	free(vulkan);
+	fprintf(stderr, "vulkan_api_destroy\n");
+}
 
 
 struct hook_context* hook_init(VkPhysicalDevice phydevice, VkDevice device, int queuefamily)
@@ -144,6 +186,7 @@ struct hook_context* hook_init(VkPhysicalDevice phydevice, VkDevice device, int 
 	return hook;
 }
 
+
 void hook_destroy(struct hook_context* hook)
 {
 	VkDevice device = vkhelper_device_get_vkdevice(hook->device);
@@ -165,11 +208,16 @@ void hook_destroy(struct hook_context* hook)
 
 /* Hook functions */
 
-VKAPI_ATTR VkResult VKAPI_CALL __hook__vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
 {
 	VkResult result;
-	fprintf(stderr, "__hook__vkCreateDevice\n");
-	result = vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+
+	fprintf(stderr, "[HOOK] vkCreateDevice\n");
+
+	if(!vulkan)
+		vulkan = vulkan_api_init();
+
+	result = vulkan->vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 
 	if(!context)
 		context = hook_init(physicalDevice, *pDevice, pCreateInfo->pQueueCreateInfos->queueFamilyIndex);
@@ -177,26 +225,32 @@ VKAPI_ATTR VkResult VKAPI_CALL __hook__vkCreateDevice(VkPhysicalDevice physicalD
 	return result;
 }
 
-VKAPI_ATTR void VKAPI_CALL __hook__vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
+VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
 {
-	fprintf(stderr, "__hook__vkDestroyDevice\n");
+	fprintf(stderr, "[HOOK] vkDestroyDevice\n");
 
 	if(context)
 	{
 		hook_destroy(context);
 		context = NULL;
 	}
-	vkDestroyDevice(device, NULL);
+	vulkan->vkDestroyDevice(device, NULL);
+
+	if(vulkan)
+	{
+		vulkan_api_destroy(vulkan);
+		vulkan = NULL;
+	}
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL __hook__vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
+VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
 {
 	static int counter = 0;
 	VkResult result;
-	result = vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+	result = vulkan->vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
 
 	if(counter == 0)
-		fprintf(stderr, "__hook__vkAcquireNextImageKHR index = %d (skip %d times)\n", *pImageIndex, SKIP_MESSAGE_TIMES);
+		fprintf(stderr, "[HOOK] vkAcquireNextImageKHR index = %d (skip %d times)\n", *pImageIndex, SKIP_MESSAGE_TIMES);
 
 	context->index = *pImageIndex;
 	vkhelper_swapchain_set_semaphore(context->device, vkhelper_device_get_swapchain(context->device), semaphore);
@@ -207,14 +261,14 @@ VKAPI_ATTR VkResult VKAPI_CALL __hook__vkAcquireNextImageKHR(VkDevice device, Vk
 	return result;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL __hook__vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
+VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
 	static int counter = 0;
 
 	VkCommandBuffer cmdbuf;
 
 	if(counter == 0)
-		fprintf(stderr, "__hook__vkQueuePresentKHR (skip %d times)\n", SKIP_MESSAGE_TIMES);
+		fprintf(stderr, "[HOOK] vkQueuePresentKHR (skip %d times)\n", SKIP_MESSAGE_TIMES);
 
 	cmdbuf = vkhelper_surface_begin_cmdbuf(context->device, context->index, VK_TRUE);
 	vkDeviceWaitIdle(vkhelper_device_get_vkdevice(context->device));
@@ -258,17 +312,17 @@ VKAPI_ATTR VkResult VKAPI_CALL __hook__vkQueuePresentKHR(VkQueue queue, const Vk
 	++counter;
 	counter %= SKIP_MESSAGE_TIMES;
 
-	return vkQueuePresentKHR(queue, pPresentInfo);
+	return vulkan->vkQueuePresentKHR(queue, pPresentInfo);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL __hook__vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
 {
 	VkResult result;
 	vkhelper_swapchain* swapchain;
 
-	fprintf(stderr, "__hook__vkCreateSwapchainKHR: w:%d, h:%d, format: %d\n", pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, pCreateInfo->imageFormat);
+	fprintf(stderr, "[HOOK] vkCreateSwapchainKHR: w:%d, h:%d, format: %d\n", pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, pCreateInfo->imageFormat);
 
-	result = vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+	result = vulkan->vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
 	swapchain = vkhelper_swapchain_create_with_vkswapchain(context->device, *pSwapchain, pCreateInfo);
 	vkhelper_device_set_swapchain(context->device, swapchain);
 
@@ -323,10 +377,10 @@ VKAPI_ATTR VkResult VKAPI_CALL __hook__vkCreateSwapchainKHR(VkDevice device, con
 	return result;
 }
 
-VKAPI_ATTR void VKAPI_CALL __hook__vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
+VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
 {
-	fprintf(stderr, "__hook__vkDestroySwapchainKHR\n");
+	fprintf(stderr, "[HOOK] vkDestroySwapchainKHR\n");
 
 	vkhelper_swapchain_destroy(context->device, vkhelper_device_get_swapchain(context->device));
-	vkDestroySwapchainKHR(device, swapchain, pAllocator);
+	vulkan->vkDestroySwapchainKHR(device, swapchain, pAllocator);
 }

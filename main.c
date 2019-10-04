@@ -58,7 +58,6 @@
 #include <linux/input.h>
 
 #include "common.h"
-#include "hook.h"
 
 enum display_mode {
    DISPLAY_MODE_AUTO = 0,
