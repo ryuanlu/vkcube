@@ -510,7 +510,7 @@ init_xcb(struct vkcube *vc)
 static void
 schedule_xcb_repaint(struct vkcube *vc)
 {
-   xcb_client_message_event_t client_message;
+   xcb_client_message_event_t client_message = {0};
 
    client_message.response_type = XCB_CLIENT_MESSAGE;
    client_message.format = 32;

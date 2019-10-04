@@ -194,6 +194,7 @@ void hook_destroy(struct hook_context* hook)
 	vkDestroyPipeline(device, hook->pipeline, NULL);
 	vkDestroyPipelineLayout(device, hook->pipelinelayout, NULL);
 	vkDestroySampler(device, hook->sampler, NULL);
+	vkFreeDescriptorSets(device, hook->desc_pool, 1, &hook->desc_set);
 	vkDestroyDescriptorSetLayout(device, hook->setlayout, NULL);
 	vkDestroyDescriptorPool(device, hook->desc_pool, NULL);
 	vkhelper_renderpass_destroy(hook->device, hook->renderpass);
